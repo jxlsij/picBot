@@ -24,6 +24,12 @@ TRIM_TOLERANCE=18
 SHARPEN_AMOUNT=1.25
 ```
 
+Image-specific options can be sent in a caption, for example:
+
+```text
+w=9 b=white t=35
+```
+
 ## Cloudflare Worker
 
 Deploy `cloudflare-worker.js` as a Worker. Its URL becomes the prefix for `TELEGRAM_API_URL`.

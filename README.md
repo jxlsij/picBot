@@ -34,6 +34,30 @@ Send the bot a photo or an image file. It will create a custom emoji set with ti
 
 For Hugging Face deployment, see [DEPLOY.md](DEPLOY.md).
 
+## Image options
+
+Put options in the image caption, or reply to an image with options:
+
+```text
+w=9
+w=9 b=white
+w=8 h=5 b=black t=35
+```
+
+Options:
+
+- `w=9` or `width=9` sets emoji grid width.
+- `h=5` or `height=5` sets emoji grid height.
+- `b=white` removes a white background.
+- `b=black` removes a black background.
+- `b=auto` removes the averaged corner background color.
+- `b=none` disables background removal.
+- `t=30` changes background tolerance.
+- `p=0.02` changes crop padding.
+- `s=1.5` changes sharpening.
+
+When an image arrives, the bot first sends `Генерирую набор...`, then edits that same message into the result.
+
 ## Notes
 
 - Custom emoji sets are a Telegram Premium feature on the client side.

@@ -50,6 +50,16 @@ class BotIdentity:
     username: str
 
 
+@dataclass(frozen=True)
+class RenderOptions:
+    columns: int | None = None
+    rows: int | None = None
+    background: str = "none"
+    tolerance: int = TRIM_TOLERANCE
+    padding_ratio: float = PADDING_RATIO
+    sharpen_amount: float = SHARPEN_AMOUNT
+
+
 class TelegramError(RuntimeError):
     pass
 
@@ -104,15 +114,62 @@ def get_json(method: str, params: dict[str, Any] | None = None) -> Any:
     return payload["result"]
 
 
-def detect_image_message(message: dict[str, Any]) -> tuple[str, str] | None:
+def detect_image_message(message: dict[str, Any]) -> tuple[str, str, dict[str, Any]] | None:
     if photos := message.get("photo"):
-        return photos[-1]["file_id"], "photo.jpg"
+        return photos[-1]["file_id"], "photo.jpg", message
 
     document = message.get("document")
     if document and str(document.get("mime_type", "")).startswith("image/"):
-        return document["file_id"], document.get("file_name") or "image"
+        return document["file_id"], document.get("file_name") or "image", message
+
+    reply = message.get("reply_to_message")
+    if reply:
+        if photos := reply.get("photo"):
+            return photos[-1]["file_id"], "photo.jpg", reply
+
+        document = reply.get("document")
+        if document and str(document.get("mime_type", "")).startswith("image/"):
+            return document["file_id"], document.get("file_name") or "image", reply
 
     return None
+
+
+def parse_options(text: str | None) -> RenderOptions:
+    values: dict[str, str] = {}
+    if text:
+        for key, value in re.findall(r"(?i)\b(w|width|h|height|b|bg|background|t|tol|tolerance|p|pad|padding|s|sharp|sharpen)\s*=\s*([^\s,;]+)", text):
+            values[key.lower()] = value.strip().lower()
+
+    def int_value(*keys: str, default: int | None = None, minimum: int = 1, maximum: int = 50) -> int | None:
+        for key in keys:
+            if key in values:
+                try:
+                    return min(maximum, max(minimum, int(values[key])))
+                except ValueError:
+                    return default
+        return default
+
+    def float_value(*keys: str, default: float, minimum: float, maximum: float) -> float:
+        for key in keys:
+            if key in values:
+                try:
+                    return min(maximum, max(minimum, float(values[key])))
+                except ValueError:
+                    return default
+        return default
+
+    background = values.get("b") or values.get("bg") or values.get("background") or "none"
+    if background not in {"auto", "none", "white", "black"}:
+        background = "auto"
+
+    return RenderOptions(
+        columns=int_value("w", "width", default=None, minimum=1, maximum=10),
+        rows=int_value("h", "height", default=None, minimum=1, maximum=10),
+        background=background,
+        tolerance=int_value("t", "tol", "tolerance", default=TRIM_TOLERANCE, minimum=0, maximum=120) or TRIM_TOLERANCE,
+        padding_ratio=float_value("p", "pad", "padding", default=PADDING_RATIO, minimum=0.0, maximum=0.25),
+        sharpen_amount=float_value("s", "sharp", "sharpen", default=SHARPEN_AMOUNT, minimum=0.0, maximum=3.0),
+    )
 
 
 def download_file(file_id: str) -> bytes:
@@ -123,7 +180,30 @@ def download_file(file_id: str) -> bytes:
     return response.content
 
 
-def grid_for_image(width: int, height: int) -> tuple[int, int]:
+def grid_for_image(width: int, height: int, options: RenderOptions) -> tuple[int, int]:
+    if options.columns and options.rows:
+        columns = options.columns
+        rows = options.rows
+        while columns * rows > MAX_EMOJIS and rows > 1:
+            rows -= 1
+        while columns * rows > MAX_EMOJIS and columns > 1:
+            columns -= 1
+        return columns, rows
+
+    if options.columns:
+        columns = options.columns
+        rows = max(1, round((height / max(width, 1)) * columns))
+        while columns * rows > MAX_EMOJIS and rows > 1:
+            rows -= 1
+        return columns, rows
+
+    if options.rows:
+        rows = options.rows
+        columns = max(1, round((width / max(height, 1)) * rows))
+        while columns * rows > MAX_EMOJIS and columns > 1:
+            columns -= 1
+        return columns, rows
+
     aspect = width / max(height, 1)
     best: tuple[float, int, int] | None = None
 
@@ -149,7 +229,37 @@ def grid_for_image(width: int, height: int) -> tuple[int, int]:
     return best[1], best[2]
 
 
-def trim_uniform_border(image: Image.Image) -> Image.Image:
+def remove_background(image: Image.Image, options: RenderOptions) -> Image.Image:
+    if options.background == "none":
+        return image
+
+    rgba = image.convert("RGBA")
+    pixels = rgba.load()
+    width, height = rgba.size
+    tolerance = options.tolerance
+
+    if options.background in {"white", "black"}:
+        target = (255, 255, 255) if options.background == "white" else (0, 0, 0)
+    else:
+        samples = [
+            rgba.getpixel((0, 0)),
+            rgba.getpixel((width - 1, 0)),
+            rgba.getpixel((0, height - 1)),
+            rgba.getpixel((width - 1, height - 1)),
+        ]
+        target = tuple(round(sum(pixel[channel] for pixel in samples) / len(samples)) for channel in range(3))
+
+    for y in range(height):
+        for x in range(width):
+            red, green, blue, alpha = pixels[x, y]
+            distance = max(abs(red - target[0]), abs(green - target[1]), abs(blue - target[2]))
+            if distance <= tolerance:
+                pixels[x, y] = (red, green, blue, 0)
+
+    return rgba
+
+
+def trim_uniform_border(image: Image.Image, options: RenderOptions) -> Image.Image:
     rgba = image.convert("RGBA")
     alpha_bbox = rgba.getchannel("A").point(lambda value: 255 if value > 8 else 0).getbbox()
     if alpha_bbox:
@@ -166,13 +276,13 @@ def trim_uniform_border(image: Image.Image) -> Image.Image:
 
     background_image = Image.new("RGBA", rgba.size, background)
     diff = ImageChops.difference(rgba, background_image).convert("L")
-    mask = diff.point(lambda value: 255 if value > TRIM_TOLERANCE else 0)
+    mask = diff.point(lambda value: 255 if value > options.tolerance else 0)
     bbox = mask.getbbox()
     if bbox is None:
         return rgba
 
     left, upper, right, lower = bbox
-    pad = round(max(right - left, lower - upper) * PADDING_RATIO)
+    pad = round(max(right - left, lower - upper) * options.padding_ratio)
     left = max(0, left - pad)
     upper = max(0, upper - pad)
     right = min(width, right + pad)
@@ -180,13 +290,14 @@ def trim_uniform_border(image: Image.Image) -> Image.Image:
     return rgba.crop((left, upper, right, lower))
 
 
-def prepare_source_image(image: Image.Image) -> Image.Image:
-    image = trim_uniform_border(image)
+def prepare_source_image(image: Image.Image, options: RenderOptions) -> Image.Image:
+    image = remove_background(image, options)
+    image = trim_uniform_border(image, options)
     alpha = image.getchannel("A")
     rgb = ImageOps.autocontrast(image.convert("RGB"), preserve_tone=True)
     image = Image.merge("RGBA", (*rgb.split(), alpha))
-    if SHARPEN_AMOUNT:
-        image = image.filter(ImageFilter.UnsharpMask(radius=1.1, percent=int(110 * SHARPEN_AMOUNT), threshold=3))
+    if options.sharpen_amount:
+        image = image.filter(ImageFilter.UnsharpMask(radius=1.1, percent=int(110 * options.sharpen_amount), threshold=3))
     return image
 
 
@@ -196,12 +307,13 @@ def encode_tile(tile: Image.Image) -> bytes:
     return output.getvalue()
 
 
-def slice_image(image_bytes: bytes) -> tuple[list[bytes], int, int]:
+def slice_image(image_bytes: bytes, options: RenderOptions | None = None) -> tuple[list[bytes], int, int]:
+    options = options or RenderOptions()
     with Image.open(io.BytesIO(image_bytes)) as source:
         image = ImageOps.exif_transpose(source).convert("RGBA")
 
-    image = prepare_source_image(image)
-    columns, rows = grid_for_image(image.width, image.height)
+    image = prepare_source_image(image, options)
+    columns, rows = grid_for_image(image.width, image.height, options)
     mosaic = ImageOps.fit(
         image,
         (columns * TILE_SIZE, rows * TILE_SIZE),
@@ -264,18 +376,47 @@ def create_custom_emoji_set(user_id: int, bot: BotIdentity, tiles: list[bytes]) 
     return pack_name
 
 
-def send_pack_link(chat_id: int, pack_name: str) -> None:
-    api(
-        "sendMessage",
-        data={
-            "chat_id": str(chat_id),
-            "text": f"https://t.me/addemoji/{pack_name}",
-            "disable_web_page_preview": "true",
-        },
-    )
+def send_status_message(chat_id: int) -> int | None:
+    try:
+        message = api("sendMessage", data={"chat_id": str(chat_id), "text": "Генерирую набор..."})
+        return message.get("message_id")
+    except TelegramError:
+        log.exception("failed to send status message")
+        return None
 
 
-def send_custom_emoji_art(chat_id: int, pack_name: str, columns: int, rows: int) -> None:
+def edit_message_text(chat_id: int, message_id: int | None, text: str, entities: list[dict[str, Any]] | None = None) -> None:
+    data: dict[str, Any] = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "disable_web_page_preview": "true",
+    }
+    if message_id is not None:
+        data["message_id"] = str(message_id)
+    if entities:
+        data["entities"] = json.dumps(entities)
+
+    if message_id is None:
+        api("sendMessage", data=data)
+        return
+
+    try:
+        api("editMessageText", data=data)
+    except TelegramError:
+        log.exception("failed to edit status message, sending a new message")
+        data.pop("message_id", None)
+        api("sendMessage", data=data)
+
+
+def send_pack_link(chat_id: int, pack_name: str, message_id: int | None = None) -> None:
+    edit_message_text(chat_id, message_id, f"https://t.me/addemoji/{pack_name}")
+
+
+def edit_error_message(chat_id: int, message_id: int | None, error: str) -> None:
+    edit_message_text(chat_id, message_id, f"Не получилось: {error}")
+
+
+def custom_emoji_art_payload(pack_name: str, columns: int, rows: int) -> tuple[str, list[dict[str, Any]]]:
     sticker_set = api("getStickerSet", data={"name": pack_name})
     stickers = sticker_set.get("stickers") or []
 
@@ -307,12 +448,20 @@ def send_custom_emoji_art(chat_id: int, pack_name: str, columns: int, rows: int)
 
         offset += len(row_text) + 1
 
+    return "\n".join(text_rows), entities
+
+
+def send_custom_emoji_art(chat_id: int, pack_name: str, columns: int, rows: int, message_id: int | None = None) -> None:
+    text, entities = custom_emoji_art_payload(pack_name, columns, rows)
+    edit_message_text(chat_id, message_id, text, entities)
+
+
+def send_pack_link_message(chat_id: int, pack_name: str) -> None:
     api(
         "sendMessage",
         data={
             "chat_id": str(chat_id),
-            "text": "\n".join(text_rows),
-            "entities": json.dumps(entities),
+            "text": f"https://t.me/addemoji/{pack_name}",
             "disable_web_page_preview": "true",
         },
     )
@@ -328,20 +477,29 @@ def handle_message(message: dict[str, Any], bot: BotIdentity) -> None:
     if user_id is None:
         return
 
-    file_id, file_name = image
-    log.info("processing image from user=%s chat=%s file=%s", user_id, chat_id, file_name)
+    file_id, file_name, image_message = image
+    options_text = message.get("caption") or message.get("text") or image_message.get("caption") or image_message.get("text")
+    options = parse_options(options_text)
+    log.info("processing image from user=%s chat=%s file=%s options=%s", user_id, chat_id, file_name, options)
 
-    image_bytes = download_file(file_id)
-    tiles, columns, rows = slice_image(image_bytes)
-    pack_name = create_custom_emoji_set(user_id, bot, tiles)
-    log.info("created custom emoji set %s with %s tiles", pack_name, len(tiles))
+    status_message_id = send_status_message(chat_id)
+
+    try:
+        image_bytes = download_file(file_id)
+        tiles, columns, rows = slice_image(image_bytes, options)
+        pack_name = create_custom_emoji_set(user_id, bot, tiles)
+        log.info("created custom emoji set %s with %s tiles (%sx%s)", pack_name, len(tiles), columns, rows)
+    except Exception as exc:
+        log.exception("failed to generate pack")
+        edit_error_message(chat_id, status_message_id, str(exc))
+        return
 
     if SEND_PACK_LINK:
         try:
-            send_custom_emoji_art(chat_id, pack_name, columns, rows)
+            send_custom_emoji_art(chat_id, pack_name, columns, rows, status_message_id)
         except TelegramError:
             log.exception("failed to send custom emoji art, sending pack link instead")
-            send_pack_link(chat_id, pack_name)
+            send_pack_link(chat_id, pack_name, status_message_id)
 
 
 def process_update(update: dict[str, Any], bot: BotIdentity) -> None:
