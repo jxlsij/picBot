@@ -408,6 +408,8 @@ def run_webhook(bot: BotIdentity) -> None:
 def run() -> None:
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN or BOT_TOKEN is required.")
+    if WEBHOOK_URL and not TELEGRAM_API_URL:
+        raise SystemExit("TELEGRAM_API_URL is required in webhook mode. Use the Cloudflare Worker URL: https://your-worker.workers.dev/bot{0}/{1}")
 
     me = get_json("getMe")
     bot = BotIdentity(username=me["username"])
