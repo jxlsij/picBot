@@ -14,6 +14,7 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 from PIL import Image, ImageChops, ImageFilter, ImageOps
+from requests import Response
 
 
 load_dotenv()
@@ -41,6 +42,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("picbot")
+SESSION = requests.Session()
 
 
 @dataclass(frozen=True)
@@ -65,8 +67,23 @@ def telegram_file_url(file_path: str) -> str:
     return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
 
 
+def request_with_retries(method: str, url: str, **kwargs: Any) -> Response:
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            return SESSION.request(method, url, timeout=120, **kwargs)
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.SSLError) as exc:
+            last_error = exc
+            if attempt == 3:
+                break
+            delay = 1.5 * (attempt + 1)
+            log.warning("telegram request failed, retrying in %.1fs: %s", delay, exc)
+            time.sleep(delay)
+    raise last_error or TelegramError("telegram request failed")
+
+
 def api(method: str, *, data: dict[str, Any] | None = None, files: dict[str, Any] | None = None) -> Any:
-    response = requests.post(telegram_api_url(method), data=data, files=files, timeout=120)
+    response = request_with_retries("POST", telegram_api_url(method), data=data, files=files)
     try:
         payload = response.json()
     except ValueError as exc:
@@ -80,7 +97,7 @@ def api(method: str, *, data: dict[str, Any] | None = None, files: dict[str, Any
 
 
 def get_json(method: str, params: dict[str, Any] | None = None) -> Any:
-    response = requests.get(telegram_api_url(method), params=params, timeout=120)
+    response = request_with_retries("GET", telegram_api_url(method), params=params)
     payload = response.json()
     if not payload.get("ok"):
         raise TelegramError(f"{method}: {payload.get('description', 'unknown Telegram error')}")
@@ -101,7 +118,7 @@ def detect_image_message(message: dict[str, Any]) -> tuple[str, str] | None:
 def download_file(file_id: str) -> bytes:
     file_info = get_json("getFile", {"file_id": file_id})
     file_path = file_info["file_path"]
-    response = requests.get(telegram_file_url(file_path), timeout=120)
+    response = request_with_retries("GET", telegram_file_url(file_path))
     response.raise_for_status()
     return response.content
 
